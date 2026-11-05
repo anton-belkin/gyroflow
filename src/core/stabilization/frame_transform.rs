@@ -34,11 +34,17 @@ impl FrameTransform {
         }
         frame_readout_time * scale
     }
-    /// `params.view_rotation` as the quaternion `recompute_smoothness` builds for `additional_rotation`
+    /// `params.view_rotation` (yaw, pitch, roll in degrees) as a camera on a tripod: turned about the vertical (yaw),
+    /// then tilted about its own horizontal axis (pitch), then rolled about where it now looks, so the roll turns the
+    /// picture about its middle. Same axes and signs as `additional_rotation`'s euler angles
     pub fn view_rotation(params: &ComputeParams) -> crate::gyro_source::Quat64 {
+        use nalgebra::Vector3;
+        use crate::gyro_source::Quat64;
         const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
-        let (x, y, z) = params.view_rotation;
-        crate::gyro_source::Quat64::from_euler_angles(y * DEG2RAD, x * DEG2RAD, z * DEG2RAD)
+        let (yaw, pitch, roll) = params.view_rotation;
+        Quat64::from_axis_angle(&Vector3::y_axis(), yaw * DEG2RAD)
+            * Quat64::from_axis_angle(&Vector3::x_axis(), pitch * DEG2RAD)
+            * Quat64::from_axis_angle(&Vector3::z_axis(), roll * DEG2RAD)
     }
 
     fn get_new_k(params: &ComputeParams, camera_matrix: &Matrix3<f64>, fov: f64) -> Matrix3<f64> {
