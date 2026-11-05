@@ -34,6 +34,13 @@ impl FrameTransform {
         }
         frame_readout_time * scale
     }
+    /// `params.view_rotation` as the quaternion `recompute_smoothness` builds for `additional_rotation`
+    pub fn view_rotation(params: &ComputeParams) -> crate::gyro_source::Quat64 {
+        const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
+        let (x, y, z) = params.view_rotation;
+        crate::gyro_source::Quat64::from_euler_angles(y * DEG2RAD, x * DEG2RAD, z * DEG2RAD)
+    }
+
     fn get_new_k(params: &ComputeParams, camera_matrix: &Matrix3<f64>, fov: f64) -> Matrix3<f64> {
         let horizontal_ratio = if params.lens.input_horizontal_stretch > 0.01 { params.lens.input_horizontal_stretch } else { 1.0 };
 
@@ -321,7 +328,7 @@ impl FrameTransform {
         let image_rotation = Matrix3::new_rotation(video_rotation * (std::f64::consts::PI / 180.0));
 
         let quat1 = gyro.org_quat_at_timestamp(timestamp_ms).inverse();
-        let smoothed_quat1 = gyro.smoothed_quat_at_timestamp(timestamp_ms);
+        let smoothed_quat1 = gyro.smoothed_quat_at_timestamp(timestamp_ms) * Self::view_rotation(params);
 
         // Only compute 1 matrix if not using rolling shutter correction
         let rows = if frame_readout_time.abs() > 0.0 { if params.frame_readout_direction.is_horizontal() { params.width } else { params.height } } else { 1 };
@@ -482,7 +489,7 @@ impl FrameTransform {
         let image_rotation = Matrix3::new_rotation(video_rotation * (std::f64::consts::PI / 180.0));
 
         let quat1 = gyro.org_quat_at_timestamp(timestamp_ms).inverse();
-        let smoothed_quat1 = gyro.smoothed_quat_at_timestamp(timestamp_ms);
+        let smoothed_quat1 = gyro.smoothed_quat_at_timestamp(timestamp_ms) * Self::view_rotation(params);
 
         // Only compute 1 matrix if not using rolling shutter correction; it stands for the whole frame, so the
         // per-row data (sensor and lens shift, lens breathing) is looked up at the centre row, like `at_timestamp` does
