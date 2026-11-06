@@ -129,7 +129,7 @@ impl DistortionModel {
         use DistortionModels as M;
         let odd: &[usize] = match &self.inner {
             M::OpenCVStandard(_) => &[2, 10, 11], // p1, s3, s4
-            M::Insta360(_) => &[3],               // p1
+            M::Insta360(_) => &[3, 8, 12, 13],    // p1 and its r² part q1, the y prism s3 s4
             _ => &[],
         };
         for &i in odd {

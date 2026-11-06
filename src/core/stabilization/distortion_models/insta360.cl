@@ -2,14 +2,14 @@
 // Copyright © 2022 Adrian <adrian.eddy at gmail>
 
 // Radial part of the projection: image radius of a unified-sphere plane radius `m`
-float radial_projection(float m, float k1, float k2, float k3) {
+float radial_projection(float m, float k1, float k2, float k3, float k4, float k5) {
     float m2 = m * m;
-    return m * (1.0f + k1*m2 + k2*m2*m2 + k3*m2*m2*m2);
+    return m * (1.0f + k1*m2 + k2*m2*m2 + k3*m2*m2*m2 + k4*m2*m2*m2*m2 + k5*m2*m2*m2*m2*m2);
 }
 // d(radial_projection)/dm
-float radial_derivative(float m, float k1, float k2, float k3) {
+float radial_derivative(float m, float k1, float k2, float k3, float k4, float k5) {
     float m2 = m * m;
-    return 1.0f + 3.0f*k1*m2 + 5.0f*k2*m2*m2 + 7.0f*k3*m2*m2*m2;
+    return 1.0f + 3.0f*k1*m2 + 5.0f*k2*m2*m2 + 7.0f*k3*m2*m2*m2 + 9.0f*k4*m2*m2*m2*m2 + 11.0f*k5*m2*m2*m2*m2*m2;
 }
 // How far the sphere reaches: it folds at theta = acos(-1/xi) (120 degrees for the X5's xi = 2), and for
 // xi <= 1 it never folds but runs to infinity, which the placeholder stands for. Never a bound on the image
@@ -21,16 +21,16 @@ float insta360_m_max(float xi) {
 // Newton on `radial_projection(m) = r`, kept on the branch the camera projects with: a step that lands where
 // the curve has stopped rising has stepped over its fold, and pulling the bracket in to there walks up to the
 // fold instead of across it. Returns the end of the branch when `r` is past everything the lens images
-float solve_radial(float r, float guess, float m_max, float k1, float k2, float k3) {
+float solve_radial(float r, float guess, float m_max, float k1, float k2, float k3, float k4, float k5) {
     float lo = 0.0f, hi = m_max;
     float m = clamp(guess, 0.0f, m_max);
     for (int i = 0; i < 20; ++i) { // Newton is done in a few; the rest are the fold's bisection
-        float d = radial_derivative(m, k1, k2, k3);
+        float d = radial_derivative(m, k1, k2, k3, k4, k5);
         if (d <= 1e-9f) {
             hi = m; // folded at or before m; the root, if there is one, is below it
             m = 0.5f * (lo + hi);
         } else {
-            float f = radial_projection(m, k1, k2, k3) - r;
+            float f = radial_projection(m, k1, k2, k3, k4, k5) - r;
             // Solved, judged on the residual and not on the size of the step: a step below an ulp of m is
             // one a GPU computes exactly and then rounds away, and a test on it never passes. See insta360.rs
             if (fabs(f) <= 2e-7f * (1.0f + r)) { break; }
@@ -51,6 +51,7 @@ float2 distort_point(float x, float y, float z, __global KernelParams *params) {
     float p1 = params->k[3];
     float p2 = params->k[4];
     float xi = params->k[5];
+    float k4 = params->k[6]; float k5 = params->k[7]; float q1 = params->k[8]; float q2 = params->k[9]; float s1 = params->k[10]; float s2 = params->k[11]; float s3 = params->k[12]; float s4 = params->k[13];
 
     float3 P = (float3)(x, y, z);
     P /= length(P);
@@ -63,8 +64,8 @@ float2 distort_point(float x, float y, float z, __global KernelParams *params) {
     float r6 = r4 * r2;
 
     return (float2)(
-        x * (1.0 + k1*r2 + k2*r4 + k3*r6) + 2.0*p1*x*y + p2*(r2 + 2.0*x*x),
-        y * (1.0 + k1*r2 + k2*r4 + k3*r6) + 2.0*p2*x*y + p1*(r2 + 2.0*y*y)
+        x * (1.0 + k1*r2 + k2*r4 + k3*r6 + k4*r4*r4 + k5*r4*r4*r2) + 2.0*(p1 + q1*r2)*x*y + (p2 + q2*r2)*(r2 + 2.0*x*x) + r2*(s1 + s2*r2),
+        y * (1.0 + k1*r2 + k2*r4 + k3*r6 + k4*r4*r4 + k5*r4*r4*r2) + 2.0*(p2 + q2*r2)*x*y + (p1 + q1*r2)*(r2 + 2.0*y*y) + r2*(s3 + s4*r2)
     );
 }
 
@@ -75,6 +76,7 @@ float2 undistort_point(float2 p, __global KernelParams *params) {
     float p1 = params->k[3];
     float p2 = params->k[4];
     float xi = params->k[5];
+    float k4 = params->k[6]; float k5 = params->k[7]; float q1 = params->k[8]; float q2 = params->k[9]; float s1 = params->k[10]; float s2 = params->k[11]; float s3 = params->k[12]; float s4 = params->k[13];
 
     float r_d = length(p);
     if (r_d < 1e-9f) { return p; }
@@ -83,7 +85,7 @@ float2 undistort_point(float2 p, __global KernelParams *params) {
     // own end is that end; where the polynomial folds first, radial_projection(m_max) is off the far side of
     // the fold and says nothing about the largest radius the lens images
     float m_max = insta360_m_max(xi);
-    if (radial_derivative(m_max, k1, k2, k3) > 0.0f && radial_projection(m_max, k1, k2, k3) < r_d) { return (float2)(-99999.0f, -99999.0f); }
+    if (radial_derivative(m_max, k1, k2, k3, k4, k5) > 0.0f && radial_projection(m_max, k1, k2, k3, k4, k5) < r_d) { return (float2)(-99999.0f, -99999.0f); }
 
     // Strip the tangential terms, invert the radial polynomial, re-evaluate them
     float2 a = p;
@@ -92,14 +94,14 @@ float2 undistort_point(float2 p, __global KernelParams *params) {
     float r_s = r_d;
     for (int i = 0; i < 3; ++i) {
         r_s = length(a);
-        m = solve_radial(r_s, m, m_max, k1, k2, k3);
+        m = solve_radial(r_s, m, m_max, k1, k2, k3, k4, k5);
         uv = r_s > 1e-12f? a * (m / r_s) : (float2)(0.0f, 0.0f);
         float r2 = dot(uv, uv);
-        a = p - (float2)(2.0f*p1*uv.x*uv.y + p2*(r2 + 2.0f*uv.x*uv.x),
-                         2.0f*p2*uv.x*uv.y + p1*(r2 + 2.0f*uv.y*uv.y));
+        a = p - (float2)(2.0f*(p1 + q1*r2)*uv.x*uv.y + (p2 + q2*r2)*(r2 + 2.0f*uv.x*uv.x) + r2*(s1 + s2*r2),
+                         2.0f*(p2 + q2*r2)*uv.x*uv.y + (p1 + q1*r2)*(r2 + 2.0f*uv.y*uv.y) + r2*(s3 + s4*r2));
     }
     // The radius the solve actually reached is the test of whether there was a ray here at all
-    if (fabs(radial_projection(m, k1, k2, k3) - r_s) > 1e-4f * (1.0f + r_s)) { return (float2)(-99999.0f, -99999.0f); }
+    if (fabs(radial_projection(m, k1, k2, k3, k4, k5) - r_s) > 1e-4f * (1.0f + r_s)) { return (float2)(-99999.0f, -99999.0f); }
 
     // Unified sphere -> ray angle. The sphere point is (u*alpha, v*alpha, alpha - xi), already a unit
     // vector, so the angle falls out of atan2 - where the old x/z went to infinity at 90 degrees

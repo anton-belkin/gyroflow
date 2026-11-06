@@ -7,15 +7,30 @@ use crate::stabilization::KernelParams;
 pub struct Insta360 { }
 
 impl Insta360 {
+    // The coefficients, in `k`: `k1 k2 k3 p1 p2 ξ` (Insta360's `offset_v3`, OpenCV's order), then the terms of
+    // `offset_v6` (RadtanPro) on top, zero for a v3 profile: `k4 k5` (r⁸, r¹⁰), `q1 q2` (the tangential pair's r²
+    // parts: p1 + q1·r², p2 + q2·r²), and the thin prism `s1 s2` (x: r², r⁴), `s3 s4` (y: r², r⁴). A RadtanPro
+    // profile's 13 terms `d0..d12` are `k1 k2 k3 k4 k5 = d0..d4`, `p2 = d5, p1 = d6, q2 = d7, q1 = d8`,
+    // `s1 = d9, s3 = d10, s2 = d11, s4 = d12` (video-types' `MeiDistortion::RadtanPro`)
+
     /// Radial part of the projection: image radius of a unified-sphere plane radius `m`
-    #[inline] fn radial(m: f32, k1: f32, k2: f32, k3: f32) -> f32 {
+    #[inline] fn radial(m: f32, kr: &[f32; 5]) -> f32 {
+        // The v3 terms as they always were, so a v3 profile solves as before
         let m2 = m * m;
-        m * (1.0 + k1*m2 + k2*m2*m2 + k3*m2*m2*m2)
+        m * (1.0 + kr[0]*m2 + kr[1]*m2*m2 + kr[2]*m2*m2*m2 + kr[3]*m2*m2*m2*m2 + kr[4]*m2*m2*m2*m2*m2)
     }
     /// `d(radial)/dm`
-    #[inline] fn radial_derivative(m: f32, k1: f32, k2: f32, k3: f32) -> f32 {
+    #[inline] fn radial_derivative(m: f32, kr: &[f32; 5]) -> f32 {
         let m2 = m * m;
-        1.0 + 3.0*k1*m2 + 5.0*k2*m2*m2 + 7.0*k3*m2*m2*m2
+        1.0 + 3.0*kr[0]*m2 + 5.0*kr[1]*m2*m2 + 7.0*kr[2]*m2*m2*m2 + 9.0*kr[3]*m2*m2*m2*m2 + 11.0*kr[4]*m2*m2*m2*m2*m2
+    }
+    /// The tangential and thin prism terms at `(x, y)`: what `distort_point` adds to the radial part
+    #[inline] fn tangential(x: f32, y: f32, k: &[f32]) -> (f32, f32) {
+        let r2 = x*x + y*y;
+        let p1 = k[3] + k[8] * r2;
+        let p2 = k[4] + k[9] * r2;
+        (2.0*p1*x*y + p2*(r2 + 2.0*x*x) + r2*(k[10] + k[11]*r2),
+         2.0*p2*x*y + p1*(r2 + 2.0*y*y) + r2*(k[12] + k[13]*r2))
     }
     /// How far the *sphere* reaches: it folds at `θ = acos(-1/ξ)` (120° for the X5's ξ = 2), and for ξ ≤ 1
     /// it never folds but runs to infinity at `acos(-ξ)`, which [`Self::field_limit`] puts an epsilon short
@@ -41,19 +56,19 @@ impl Insta360 {
     ///
     /// The answer is only an answer if it reaches `r`: past the end of the rising branch there is no `m`
     /// with `radial(m) = r` and this returns the end of the branch instead, which the caller checks for
-    #[inline] fn solve_radial(r: f32, guess: f32, m_max: f32, k1: f32, k2: f32, k3: f32) -> f32 {
+    #[inline] fn solve_radial(r: f32, guess: f32, m_max: f32, kr: &[f32; 5]) -> f32 {
         let (mut lo, mut hi) = (0.0f32, m_max);
         let mut m = guess.max(0.0).min(m_max);
         // Newton is done in three or four; the twenty are for the last ring of the image circle, where the
         // curve is nearly flat and a step overshoots the fold, and the way back is a bisection
         for _ in 0..20 {
-            let d = Self::radial_derivative(m, k1, k2, k3);
+            let d = Self::radial_derivative(m, kr);
             if d <= 1e-9 {
                 // The curve has folded at or before `m`; the root, if there is one, is below it
                 hi = m;
                 m = 0.5 * (lo + hi);
             } else {
-                let f = Self::radial(m, k1, k2, k3) - r;
+                let f = Self::radial(m, kr) - r;
                 // Solved, judged on the residual: `radial(m)` is only good to a few ulp of itself, so this
                 // is the floor the solve can reach, and the final check below asks for 1e-4. Not on the
                 // size of the Newton step: below an ulp of `m` that step is one a GPU computes exactly as
@@ -77,11 +92,7 @@ impl Insta360 {
     }
 
     pub fn undistort_point(&self, point: (f32, f32), params: &KernelParams) -> Option<(f32, f32)> {
-        let k1 = params.k[0];
-        let k2 = params.k[1];
-        let k3 = params.k[2];
-        let p1 = params.k[3];
-        let p2 = params.k[4];
+        let kr = &[params.k[0], params.k[1], params.k[2], params.k[6], params.k[7]];
         let xi = params.k[5];
 
         let r_d = (point.0 * point.0 + point.1 * point.1).sqrt();
@@ -92,7 +103,7 @@ impl Insta360 {
         // the far side of the fold and says nothing about the largest radius the lens images; the solve's
         // own answer, checked below, is what decides there
         let m_max = Self::m_max(xi);
-        if Self::radial_derivative(m_max, k1, k2, k3) > 0.0 && Self::radial(m_max, k1, k2, k3) < r_d { return None; }
+        if Self::radial_derivative(m_max, kr) > 0.0 && Self::radial(m_max, kr) < r_d { return None; }
 
         // Strip the tangential terms, invert the radial polynomial, re-evaluate them: three passes are
         // already exact to ~1e-9 of the ray radius, and unlike a fixed-point iteration on the whole
@@ -102,19 +113,19 @@ impl Insta360 {
         let (mut u, mut v, mut m, mut r_s) = (0.0f32, 0.0f32, r_d, r_d);
         for _ in 0..3 {
             r_s = (ax * ax + ay * ay).sqrt();
-            m = Self::solve_radial(r_s, m, m_max, k1, k2, k3);
+            m = Self::solve_radial(r_s, m, m_max, kr);
             let s = if r_s > 1e-12 { m / r_s } else { 0.0 };
             u = ax * s;
             v = ay * s;
-            let r2 = u*u + v*v;
-            ax = point.0 - (2.0*p1*u*v + p2*(r2 + 2.0*u*u));
-            ay = point.1 - (2.0*p2*u*v + p1*(r2 + 2.0*v*v));
+            let (tx, ty) = Self::tangential(u, v, &params.k);
+            ax = point.0 - tx;
+            ay = point.1 - ty;
         }
         // `solve_radial` returns the end of the rising branch when `r` is past everything the lens images,
         // so the radius it actually reached is the test of whether there was a ray here at all. This is the
         // whole of the rejection wherever the polynomial folds inside the sphere - a ξ ≤ 1 body has no
         // sphere fold to be bounded by, and asking a folded polynomial for its maximum gives nonsense
-        if (Self::radial(m, k1, k2, k3) - r_s).abs() > 1e-4 * (1.0 + r_s) { return None; }
+        if (Self::radial(m, kr) - r_s).abs() > 1e-4 * (1.0 + r_s) { return None; }
 
         // Unified sphere -> ray angle. The sphere point is `(u·α, v·α, α - ξ)`, already a unit vector, so
         // the angle falls out of `atan2` - where the old `x/z` went to infinity at 90° and cost an X4/X5
@@ -132,11 +143,7 @@ impl Insta360 {
     }
 
     pub fn distort_point(&self, mut x: f32, mut y: f32, z: f32, params: &KernelParams) -> (f32, f32) {
-        let k1 = params.k[0];
-        let k2 = params.k[1];
-        let k3 = params.k[2];
-        let p1 = params.k[3];
-        let p2 = params.k[4];
+        let kr = &[params.k[0], params.k[1], params.k[2], params.k[6], params.k[7]];
         let xi = params.k[5];
 
         let len = (x.powi(2) + y.powi(2) + z.powi(2)).sqrt();
@@ -144,13 +151,18 @@ impl Insta360 {
         x = (x / len) / ((z / len) + xi);
         y = (y / len) / ((z / len) + xi);
 
+        // The v3 terms in the order they always were, so a v3 profile renders bit for bit as before
+        let k = &params.k;
         let r2 = x*x + y*y;
         let r4 = r2 * r2;
         let r6 = r4 * r2;
-
+        let r8 = r4 * r4;
+        let radial = 1.0 + kr[0]*r2 + kr[1]*r4 + kr[2]*r6 + kr[3]*r8 + kr[4]*r8*r2;
+        let p1 = k[3] + k[8] * r2;
+        let p2 = k[4] + k[9] * r2;
         (
-            x * (1.0 + k1*r2 + k2*r4 + k3*r6) + 2.0*p1*x*y + p2*(r2 + 2.0*x*x),
-            y * (1.0 + k1*r2 + k2*r4 + k3*r6) + 2.0*p2*x*y + p1*(r2 + 2.0*y*y)
+            x * radial + 2.0*p1*x*y + p2*(r2 + 2.0*x*x) + r2*(k[10] + k[11]*r2),
+            y * radial + 2.0*p2*x*y + p1*(r2 + 2.0*y*y) + r2*(k[12] + k[13]*r2)
         )
     }
     pub fn adjust_lens_profile(&self, _profile: &mut crate::LensProfile) { }
@@ -170,13 +182,15 @@ impl Insta360 {
     pub fn distortion_derivative(&self, theta: f64, k: &[f64]) -> Option<f64> {
         if k.len() < 6 { return None; }
         let (k1, k2, k3, xi) = (k[0], k[1], k[2], k[5]);
+        let (k4, k5) = (k.get(6).copied().unwrap_or(0.0), k.get(7).copied().unwrap_or(0.0));
         let c = theta.cos();
         let d = c + xi;
         if d.abs() < 1e-9 { return None; }
         let m = theta.sin() / d;
         let m2 = m * m;
         let dm_dtheta = (1.0 + xi * c) / (d * d);
-        let dr_dm = 1.0 + 3.0*k1*m2 + 5.0*k2*m2*m2 + 7.0*k3*m2*m2*m2;
+        let m4 = m2 * m2;
+        let dr_dm = 1.0 + 3.0*k1*m2 + 5.0*k2*m4 + 7.0*k3*m4*m2 + 9.0*k4*m4*m4 + 11.0*k5*m4*m4*m2;
         Some(dr_dm * dm_dtheta)
     }
 
@@ -185,4 +199,84 @@ impl Insta360 {
 
     pub fn opencl_functions(&self) -> &'static str { include_str!("insta360.cl") }
     pub fn wgsl_functions(&self)   -> &'static str { include_str!("insta360.wgsl") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The X5's lens 0 of the sample clip: Mei ξ = 2, RadtanPro d0..d12 (telemetry-parser's CameraRig)
+    const X5: [f64; 14] = [0.24259843, 1.33183777, 0.03402105, -4.60448074, 0.0, -0.00078776, -0.00109209, 0.01341257, 0.00341814, -0.00505066, 0.00070317, -0.00831295, -0.00288465, 2.0];
+
+    /// RadtanPro's 13 terms and ξ into the model's coefficients
+    fn radtan_pro(d: &[f64; 14]) -> KernelParams {
+        let mut p = KernelParams::default();
+        let k = [d[0], d[1], d[2], d[6], d[5], d[13], d[3], d[4], d[8], d[7], d[9], d[11], d[10], d[12]];
+        for (i, v) in k.iter().enumerate() { p.k[i] = *v as f32; }
+        p
+    }
+
+    /// video-types' `MeiDistortion::RadtanPro`, in f64, as written there
+    fn reference(d: &[f64; 14], ray: [f64; 3]) -> (f64, f64) {
+        let n = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt();
+        let (x, y, z) = (ray[0] / n, ray[1] / n, ray[2] / n);
+        let (mx, my) = (x / (d[13] + z), y / (d[13] + z));
+        let r2 = mx * mx + my * my;
+        let r = 1.0 + d[0] * r2 + d[1] * r2.powi(2) + d[2] * r2.powi(3) + d[3] * r2.powi(4) + d[4] * r2.powi(5);
+        (mx * r + (r2 + 2.0 * mx * mx) * (d[5] + d[7] * r2) + 2.0 * mx * my * (d[6] + d[8] * r2) + d[9] * r2 + d[11] * r2 * r2,
+         my * r + (r2 + 2.0 * my * my) * (d[6] + d[8] * r2) + 2.0 * mx * my * (d[5] + d[7] * r2) + d[10] * r2 + d[12] * r2 * r2)
+    }
+
+    fn rays() -> impl Iterator<Item = [f64; 3]> {
+        (0..=50).flat_map(|i| (0..16).map(move |j| {
+            let theta = (i as f64 * 2.0).to_radians();
+            let phi = (j as f64 * 22.5 + 3.0).to_radians();
+            [theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos()]
+        }))
+    }
+
+    #[test]
+    fn radtan_pro_as_video_types_has_it() {
+        let p = radtan_pro(&X5);
+        for ray in rays() {
+            let (u, v) = Insta360::default().distort_point(ray[0] as f32, ray[1] as f32, ray[2] as f32, &p);
+            let (eu, ev) = reference(&X5, ray);
+            // f32 of the image radius, about 1.2 at 100°: a thousandth of a pixel at the X5's focal (~3000 px)
+            assert!((u as f64 - eu).abs() < 2e-6 && (v as f64 - ev).abs() < 2e-6, "{ray:?}: {u} {v} against {eu} {ev}");
+        }
+    }
+
+    #[test]
+    fn radtan_pro_undistorts_back() {
+        let p = radtan_pro(&X5);
+        let m = Insta360::default();
+        for ray in rays() {
+            let theta = ray[0].hypot(ray[1]).atan2(ray[2]);
+            let (u, v) = m.distort_point(ray[0] as f32, ray[1] as f32, ray[2] as f32, &p);
+            let (a, b) = m.undistort_point((u, v), &p).expect("a ray inside the field");
+            // The point path's rays are angle vectors: θ·(x, y)/ρ
+            let rho = ray[0].hypot(ray[1]);
+            let (ea, eb) = if rho > 1e-12 { (theta * ray[0] / rho, theta * ray[1] / rho) } else { (0.0, 0.0) };
+            assert!((a as f64 - ea).abs() < 2e-5 && (b as f64 - eb).abs() < 2e-5, "θ {:.1}°: {a} {b} against {ea} {eb}", theta.to_degrees());
+        }
+    }
+
+    #[test]
+    fn a_v3_profile_is_untouched_by_the_new_terms() {
+        // k1 k2 k3 p1 p2 ξ, the rest zero: the formula as it was before the RadtanPro terms
+        let k = [0.1f32, -0.05, 0.01, 0.002, -0.001, 1.8];
+        let mut p = KernelParams::default();
+        p.k[..6].copy_from_slice(&k);
+        for ray in rays() {
+            let (x, y, z) = (ray[0] as f32, ray[1] as f32, ray[2] as f32);
+            let len = (x.powi(2) + y.powi(2) + z.powi(2)).sqrt();
+            let (x0, y0) = ((x / len) / ((z / len) + k[5]), (y / len) / ((z / len) + k[5]));
+            let r2 = x0*x0 + y0*y0;
+            let r4 = r2 * r2;
+            let r6 = r4 * r2;
+            let old = (x0 * (1.0 + k[0]*r2 + k[1]*r4 + k[2]*r6) + 2.0*k[3]*x0*y0 + k[4]*(r2 + 2.0*x0*x0),
+                       y0 * (1.0 + k[0]*r2 + k[1]*r4 + k[2]*r6) + 2.0*k[4]*x0*y0 + k[3]*(r2 + 2.0*y0*y0));
+            assert_eq!(Insta360::default().distort_point(x, y, z, &p), old);
+        }
+    }
 }
