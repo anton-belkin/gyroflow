@@ -107,9 +107,17 @@ impl OpticalCorrection {
     /// The orientation of a file without motion data, as the renderer gets it: `video_base` at 1 kHz
     pub fn base_quats(&self) -> TimeQuat { base_quats(&self.video_base) }
 
-    /// Whether it was measured on (uncorrected) quaternions of this `checksum`, in this context (`context_checksum`)
-    pub fn measured_on(&self, quats_checksum: u64, context_checksum: u64) -> bool {
-        !self.coeffs.is_empty() && self.quats_checksum == quats_checksum && self.context_checksum == context_checksum
+    /// Whether it was measured on (uncorrected) quaternions of this fingerprint, in this context (`context_checksum`).
+    /// Up to the last bits another machine computes them with, see `Fingerprint::matches`
+    pub fn measured_on(&self, quats: &Fingerprint, context: &Fingerprint) -> bool {
+        !self.coeffs.is_empty() && quats.matches(self.quats_checksum) && context.matches(self.context_checksum)
+    }
+    /// What of `measured_on` doesn't match, for the log
+    pub fn mismatch(&self, quats: &Fingerprint, context: &Fingerprint) -> String {
+        let mut what = Vec::new();
+        if !quats.matches(self.quats_checksum) { what.push(format!("the motion data ({:016x} here, {:016x} measured)", quats.checksum(), self.quats_checksum)); }
+        if !context.matches(self.context_checksum) { what.push(format!("the sync, lens or frame timing ({:016x} here, {:016x} measured)", context.checksum(), self.context_checksum)); }
+        what.join(" and ")
     }
 
     pub fn apply(&self, quats: &mut TimeQuat) {
@@ -210,9 +218,13 @@ pub fn hold_over_clip(quats: &mut TimeQuat, duration_ms: f64) {
 
 /// Fingerprint of a set of quaternions. Stored in project files, so it's FNV-1a rather than std's hasher, whose
 /// output may change between Rust releases, and it rounds the components, so the last bit of a filter computed on
-/// another machine doesn't make a correction stale
+/// another machine doesn't make a correction stale (`Fingerprint::matches`)
 pub fn checksum(quats: &TimeQuat) -> u64 {
-    let mut h = Fnv::default();
+    fingerprint(quats).checksum()
+}
+/// What `checksum` is taken of
+pub fn fingerprint(quats: &TimeQuat) -> Fingerprint {
+    let mut h = Fingerprint::default();
     h.eat(quats.len() as u64);
     for (ts, q) in quats.iter().step_by((quats.len() / 1024).max(1)) {
         h.eat(*ts as u64);
@@ -220,7 +232,113 @@ pub fn checksum(quats: &TimeQuat) -> u64 {
             h.eat_rounded(*v, 1e6);
         }
     }
-    h.0
+    h
+}
+
+/// What a fingerprint stored in a project (`checksum`, `optical_motion::context_checksum`) is taken of: its words in
+/// order, the rounded ones with the value they were rounded from. Rounding alone doesn't make it portable: another
+/// machine (another CPU, libm or GPU backend) computes the last bits of a value differently, and where that value is
+/// near the middle between two units it rounds the other way and the checksum is another one: `matches` takes the
+/// values nearest to the middle either way
+#[derive(Clone, Debug, Default)]
+pub struct Fingerprint {
+    words: Vec<Word>,
+    /// The last `matches`: the search it may take is done once per checksum
+    matched: std::sync::Arc<parking_lot::Mutex<Option<(u64, bool)>>>,
+}
+#[derive(Clone, Copy, Debug)]
+enum Word {
+    Exact(u64),
+    /// In units of the resolution, before the rounding
+    Rounded(f64),
+}
+impl Word {
+    fn word(&self) -> u64 {
+        match *self { Word::Exact(v) => v, Word::Rounded(v) => v.round() as i64 as u64 }
+    }
+    /// Rounded the other way: the unit on the other side of the middle it's nearest to
+    fn other(&self) -> u64 {
+        match *self {
+            Word::Exact(v) => v,
+            Word::Rounded(v) => { let r = v.round(); (if v >= r { r + 1.0 } else { r - 1.0 }) as i64 as u64 },
+        }
+    }
+    /// How near the middle between two units it is, for a value of its size: the distance in units, relative to the
+    /// value, as its last bits are (a value up to a million units counts as one of a million). None for an exact one
+    fn nearness(&self) -> Option<f64> {
+        match *self { Word::Exact(_) => None, Word::Rounded(v) => Some(((v - v.floor()) - 0.5).abs() / v.abs().max(1e6)) }
+    }
+}
+impl Fingerprint {
+    /// How many words the search may hash on each side, all tries together: some milliseconds, also for a correction
+    /// that is stale (then it's searched once per context, `matched`)
+    const BUDGET: usize = 1 << 20;
+
+    pub fn eat(&mut self, v: u64) { self.words.push(Word::Exact(v)); }
+    /// `v` in whole units of `1 / scale`
+    pub fn eat_rounded(&mut self, v: f64, scale: f64) { self.words.push(Word::Rounded(v * scale)); }
+    /// Nothing taken yet: not known
+    pub fn is_empty(&self) -> bool { self.words.is_empty() }
+
+    pub fn checksum(&self) -> u64 {
+        self.words.iter().fold(Fnv::default().0, |h, w| fnv_eat(h, w.word()))
+    }
+
+    /// Whether `checksum` is this fingerprint's as another machine may have computed it: with the values nearest to
+    /// the middle between two units (`Word::nearness`) rounded either way, as many of them as `BUDGET` affords - 26
+    /// of the context's 88, 14 of the quaternions'. Every combination of them is tried, meeting in the middle: those
+    /// of the first half of them hashed forward from the start, those of the second half unwound from `checksum`
+    /// (FNV-1a is invertible), a match where the two meet
+    pub fn matches(&self, checksum: u64) -> bool {
+        if self.words.is_empty() { return false; }
+        if let Some((c, m)) = *self.matched.lock() { if c == checksum { return m; } }
+        let m = self.checksum() == checksum || self.search(checksum);
+        *self.matched.lock() = Some((checksum, m));
+        m
+    }
+    fn search(&self, checksum: u64) -> bool {
+        let mut near: Vec<(f64, usize)> = self.words.iter().enumerate().filter_map(|(i, w)| Some((w.nearness()?, i))).collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // The larger half's 2^((k + 1) / 2) tries, over up to all of the words
+        let mut k = 0;
+        while k < near.len() && (self.words.len() << ((k + 2) / 2)) <= Self::BUDGET { k += 1; }
+        let mut at: Vec<usize> = near[..k].iter().map(|(_, i)| *i).collect();
+        if at.is_empty() { return false; }
+        at.sort_unstable();
+        let step = |states: Vec<u64>, i: usize, f: fn(u64, u64) -> u64| -> Vec<u64> {
+            let w = self.words[i];
+            if at.binary_search(&i).is_ok() { states.iter().flat_map(|&h| [f(h, w.word()), f(h, w.other())]).collect() }
+            else { states.into_iter().map(|h| f(h, w.word())).collect() }
+        };
+        let split = at[at.len() / 2];
+        let forward: std::collections::HashSet<u64> = (0..split).fold(vec![Fnv::default().0], |h, i| step(h, i, fnv_eat)).into_iter().collect();
+        let backward = (split..self.words.len()).rev().fold(vec![checksum], |h, i| step(h, i, fnv_uneat));
+        backward.iter().any(|h| forward.contains(h))
+    }
+}
+
+const FNV_PRIME: u64 = 0x100000001b3;
+/// Its inverse modulo 2^64, by Newton's iteration (each one doubles the bits that are right)
+const FNV_PRIME_INVERSE: u64 = {
+    let mut x = FNV_PRIME;
+    let mut i = 0;
+    while i < 6 { x = x.wrapping_mul(2u64.wrapping_sub(FNV_PRIME.wrapping_mul(x))); i += 1; }
+    x
+};
+/// `h` with the word `v` hashed in
+fn fnv_eat(mut h: u64, v: u64) -> u64 {
+    for b in v.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+/// The `h` that `fnv_eat(h, v)` was
+fn fnv_uneat(mut h: u64, v: u64) -> u64 {
+    for b in v.to_le_bytes().into_iter().rev() {
+        h = h.wrapping_mul(FNV_PRIME_INVERSE) ^ b as u64;
+    }
+    h
 }
 
 /// FNV-1a over 64-bit words, for the fingerprints kept in project files
@@ -230,13 +348,74 @@ impl Default for Fnv {
 }
 impl Fnv {
     pub fn eat(&mut self, v: u64) {
-        for b in v.to_le_bytes() {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
+        self.0 = fnv_eat(self.0, v);
     }
     /// `v` in whole units of `1 / scale`
     pub fn eat_rounded(&mut self, v: f64, scale: f64) {
         self.eat((v * scale).round() as i64 as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn of(values: &[f64]) -> Fingerprint {
+        let mut f = Fingerprint::default();
+        f.eat(values.len() as u64);
+        for v in values { f.eat_rounded(*v, 1e6); }
+        f
+    }
+
+    #[test]
+    fn fingerprint_checksum_is_the_old_one() {
+        let values: [f64; 4] = [0.1234564999, -0.5, 0.25, 1e-7];
+        let mut h = Fnv::default();
+        h.eat(values.len() as u64);
+        for v in values { h.eat((v * 1e6).round() as i64 as u64); }
+        assert_eq!(of(&values).checksum(), h.0);
+    }
+
+    #[test]
+    fn last_bits_elsewhere_still_match() {
+        // Measured where these came out a hair below the middle, recomputed here a hair above it
+        let there: Vec<f64> = (0..300).map(|i| i as f64 * 1e-5).chain([0.1234564999, -0.0000025001, 0.9876545]).collect();
+        let here: Vec<f64> = (0..300).map(|i| i as f64 * 1e-5).chain([0.1234565001, -0.0000024999, 0.98765451]).collect();
+        let stored = of(&there).checksum();
+        assert_ne!(of(&here).checksum(), stored);
+        assert!(of(&here).matches(stored));
+        assert!(of(&there).matches(stored));
+        // Memoized either way
+        let f = of(&here);
+        assert!(f.matches(stored) && f.matches(stored));
+    }
+
+    #[test]
+    fn fnv_unwinds() {
+        assert_eq!(FNV_PRIME.wrapping_mul(FNV_PRIME_INVERSE), 1);
+        let h = fnv_eat(fnv_eat(Fnv::default().0, 7), u64::MAX - 3);
+        assert_eq!(fnv_uneat(fnv_uneat(h, u64::MAX - 3), 7), Fnv::default().0);
+    }
+
+    #[test]
+    fn many_last_bits_elsewhere_still_match() {
+        // Twenty values a hair from the middle, on the other side of it here, among values on a unit
+        let base = |i: usize| i as f64 * 1e-5;
+        let there: Vec<f64> = (0..300).map(|i| if i % 15 == 7 { base(i) + 0.5e-6 - 1e-10 * (i as f64 + 1.0) } else { base(i) }).collect();
+        let here: Vec<f64> = (0..300).map(|i| if i % 15 == 7 { base(i) + 0.5e-6 + 1e-10 * (i as f64 + 1.0) } else { base(i) }).collect();
+        let stored = of(&there).checksum();
+        assert_ne!(of(&here).checksum(), stored);
+        assert!(of(&here).matches(stored));
+    }
+
+    #[test]
+    fn a_real_change_does_not_match() {
+        let there: Vec<f64> = (0..300).map(|i| i as f64 * 1e-5).collect();
+        let mut here = there.clone();
+        here[17] += 3e-6;
+        let f = of(&here);
+        assert!(!f.matches(of(&there).checksum()));
+        assert!(!f.matches(of(&there).checksum()));
+        assert!(!Fingerprint::default().matches(Fingerprint::default().checksum()));
     }
 }

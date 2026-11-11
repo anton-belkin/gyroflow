@@ -31,7 +31,7 @@ use nalgebra::{ DMatrix, Matrix3, Rotation3, UnitQuaternion, Vector3 };
 use rayon::prelude::*;
 
 use crate::StabilizationManager;
-use crate::gyro_source::{ GyroSource, OpticalCorrection, OpticalCorrectionSettings, TimeQuat, TrackingMethod, optical_correction::{ self, Fnv } };
+use crate::gyro_source::{ GyroSource, OpticalCorrection, OpticalCorrectionSettings, TimeQuat, TrackingMethod, optical_correction::{ self, Fingerprint } };
 use crate::stabilization::{ ComputeParams, FrameTransform, undistort_points_for_optical_motion };
 use solver::{ BandMeasurement, SolverParams };
 
@@ -758,10 +758,15 @@ pub fn measurement_params(stab: &StabilizationManager) -> ComputeParams {
 /// lens, with all of its per-frame data (`undistort_points_for_optical_motion`). Taken from what these give at a few
 /// frames rather than from the settings behind them, so every setting that moves a pixel's time or ray is in it,
 /// including ones this doesn't know of, and none that doesn't is. Rounded far below anything that matters (1 µs,
-/// 1 µrad), so the last bit of a computation elsewhere doesn't make a correction stale. The sync points go in as they
+/// 1 µrad), and matched up to the last bits a computation elsewhere gives (`Fingerprint::matches`), so another
+/// machine's libm doesn't make a correction stale. The sync points go in as they
 /// are: one anywhere in the clip moves the frames around it. Takes the `gyro` lock: not for a caller that holds it
 pub fn context_checksum(params: &ComputeParams) -> u64 {
-    let mut h = Fnv::default();
+    context_fingerprint(params).checksum()
+}
+/// What `context_checksum` is taken of
+pub fn context_fingerprint(params: &ComputeParams) -> Fingerprint {
+    let mut h = Fingerprint::default();
     h.eat(params.width as u64);
     h.eat(params.height as u64);
     h.eat_rounded(params.scaled_fps, 1e6);
@@ -788,7 +793,7 @@ pub fn context_checksum(params: &ComputeParams) -> u64 {
             }
         }
     }
-    h.0
+    h
 }
 
 /// When the frame `index` is read out, over `rows` rows (or columns) of the tracked picture: the rolling shutter timing
