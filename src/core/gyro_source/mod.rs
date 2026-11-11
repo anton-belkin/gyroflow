@@ -110,13 +110,14 @@ pub struct GyroSource {
     /// Whether the last `integrate` applied it: an enabled one that doesn't match the quaternions is stale
     #[serde(skip)]
     pub optical_correction_applied: bool,
-    /// `optical_correction::checksum` of the quaternions the last `integrate` composed it onto, or would have
+    /// `optical_correction::fingerprint` of the quaternions the last `integrate` composed it onto, or would have
     #[serde(skip)]
-    pub optical_uncorrected_checksum: u64,
+    pub optical_uncorrected: optical_correction::Fingerprint,
     /// The context the correction applies in: what `optical_motion::context_checksum` makes of the current sync, lens
-    /// and frame timing. Kept up to date by `StabilizationManager::refresh_optical_correction`
+    /// and frame timing. Kept up to date by `StabilizationManager::refresh_optical_correction`; empty until it first
+    /// does (a project's correction is read before the rest of the project)
     #[serde(skip)]
-    pub optical_context: u64,
+    pub optical_context: optical_correction::Fingerprint,
     /// Whether the last `integrate` took the motion from the video (`OpticalCorrection::video_base`): a file without
     /// motion data, or with its own set aside
     #[serde(skip)]
@@ -337,8 +338,8 @@ impl GyroSource {
             all_metadata: self.all_metadata,
             optical_correction: self.optical_correction.clone(),
             optical_correction_applied: self.optical_correction_applied,
-            optical_uncorrected_checksum: self.optical_uncorrected_checksum,
-            optical_context: self.optical_context,
+            optical_uncorrected: self.optical_uncorrected.clone(),
+            optical_context: self.optical_context.clone(),
             motion_from_video: self.motion_from_video,
             ignored_motion: self.ignored_motion.clone(),
             fps_scale: self.fps_scale,
@@ -1168,7 +1169,7 @@ impl GyroSource {
                 // A file without motion data: what the analysis measured between the frames is all there is. It's
                 // fingerprinted as the analysis fingerprints it (`optical_motion`'s `finish`), of all of it at once
                 let base = c.base_quats();
-                self.optical_uncorrected_checksum = optical_correction::checksum(&base);
+                self.optical_uncorrected = optical_correction::fingerprint(&base);
                 // A video cut from recordings has it part by part, each part's as its range trimmed alone has it, on the
                 // grid from the part's start and without a stretch between two parts' frames
                 self.quaternions = Arc::new(match self.segments.as_deref() {
@@ -1176,14 +1177,14 @@ impl GyroSource {
                     None => base,
                 });
             } else {
-                self.optical_uncorrected_checksum = optical_correction::checksum(&self.quaternions);
+                self.optical_uncorrected = optical_correction::fingerprint(&self.quaternions);
             }
             // The orientations `integrate` just made, which nothing else shares yet: changed in place, not copied
             if self.optical_correction_applies() {
                 c.apply(Arc::make_mut(&mut self.quaternions));
                 self.optical_correction_applied = true;
-            } else if c.enabled {
-                log::warn!("The optical correction was measured on other motion data (another integration method or filter), sync, lens or frame timing, not applying it");
+            } else if c.enabled && !self.optical_context.is_empty() {
+                log::warn!("The optical correction was measured on other {}, not applying it", c.mismatch(&self.optical_uncorrected, &self.optical_context));
             }
             if from_video {
                 // Held over the clip's ends: the first part's from the start, the last part's to the end on its own grid
@@ -1201,7 +1202,7 @@ impl GyroSource {
     }
     /// Whether `integrate` composes the correction onto the quaternions, as things stand
     pub fn optical_correction_applies(&self) -> bool {
-        self.optical_correction.as_ref().is_some_and(|c| c.enabled && c.measured_on(self.optical_uncorrected_checksum, self.optical_context))
+        self.optical_correction.as_ref().is_some_and(|c| c.enabled && c.measured_on(&self.optical_uncorrected, &self.optical_context))
     }
 
     /// The smoothed orientations, as the correction from each of them to the camera's, and the largest angles between
@@ -1583,7 +1584,7 @@ impl GyroSource {
         std::mem::swap(&mut self.raw_imu, &mut from.raw_imu);
         std::mem::swap(&mut self.quaternions, &mut from.quaternions);
         self.optical_correction_applied = from.optical_correction_applied;
-        self.optical_uncorrected_checksum = from.optical_uncorrected_checksum;
+        self.optical_uncorrected = from.optical_uncorrected.clone();
         self.motion_from_video = from.motion_from_video;
     }
 

@@ -1451,9 +1451,9 @@ impl StabilizationManager {
         *kept = None;
     }
     /// The context a correction applies in, as things are now, see `optical_motion::context_checksum`
-    fn optical_context(&self) -> u64 {
-        use synchronization::optical_motion::{ context_checksum, measurement_params };
-        context_checksum(&measurement_params(self))
+    fn optical_context(&self) -> gyro_source::optical_correction::Fingerprint {
+        use synchronization::optical_motion::{ context_fingerprint, measurement_params };
+        context_fingerprint(&measurement_params(self))
     }
     /// Brings the correction up to date with its context: a sync, a lens profile or a frame timing other than the ones
     /// it was measured with switches it off (and back on, when they come back), without `integrate` hearing of it. The
@@ -1542,7 +1542,7 @@ impl StabilizationManager {
     fn valid_optical_measurements(&self) -> Option<Arc<synchronization::optical_motion::OpticalMeasurements>> {
         let m = self.optical_measurements.read().clone()?;
         let gyro = self.gyro.read();
-        (gyro.optical_correction.is_some() && m.quats_checksum == gyro.optical_uncorrected_checksum && m.context_checksum == gyro.optical_context).then_some(m)
+        (gyro.optical_correction.is_some() && gyro.optical_uncorrected.matches(m.quats_checksum) && gyro.optical_context.matches(m.context_checksum)).then_some(m)
     }
     /// Sets the strength; true when the correction should be refitted to it, see `refit_optical_correction`
     pub fn set_optical_correction_strength(&self, strength: f64) -> bool {
